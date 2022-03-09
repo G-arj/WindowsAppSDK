@@ -21,6 +21,7 @@
 #include "PushNotificationUtility.h"
 #include "AppNotificationUtility.h"
 #include "PushNotificationReceivedEventArgs.h"
+#include <WindowsAppRuntime.SelfContained.h>
 
 using namespace std::literals;
 using namespace Microsoft::Windows::AppNotifications::Helpers;
@@ -111,10 +112,18 @@ namespace winrt::Microsoft::Windows::PushNotifications::implementation
     }
     CATCH_RETURN()
 
+    bool PushNotificationManager::IsSupported()
+    {
+        // Only scenarios that use the Background Infrastructure component of the OS support Push in the SelfContained case
+        static bool isSupported{ !WindowsAppRuntime::SelfContained::IsSelfContained() || PushNotificationHelpers::IsPackagedAppScenario() };
+        return isSupported;
+       
+    }
+
     winrt::Microsoft::Windows::PushNotifications::PushNotificationManager PushNotificationManager::Default()
     {
         THROW_HR_IF(E_NOTIMPL, !::Microsoft::Windows::PushNotifications::Feature_PushNotifications::IsEnabled());
-
+        THROW_HR_IF_MSG(E_FAIL, !IsSupported(), "Push APIs are not supported for this Application Type!");
         static wil::srwlock lock;
 
         auto criticalSection{ lock.lock_exclusive() };
@@ -142,23 +151,34 @@ namespace winrt::Microsoft::Windows::PushNotifications::implementation
 
     winrt::Windows::Foundation::IInspectable PushNotificationManager::Deserialize(winrt::Windows::Foundation::Uri const& uri)
     {
-        // Verify if the uri contains a background notification payload.
-        // Otherwise, we expect to process the notification in a background task.
-        for (auto const& pair : uri.QueryParsed())
+        winrt::Microsoft::Windows::PushNotifications::PushNotificationReceivedEventArgs eventArgs{ nullptr };
+
+        // All packaged processes are triggered through COM via Long Running Process or the Background Infra OS component
+        if (AppModel::Identity::IsPackagedProcess())
         {
-            if (pair.Name() == L"payload")
+            THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_TIMEOUT), !m_waitHandleForArgs.wait(c_receiveArgsTimeoutInMSec));
+            auto lock{ m_lock.lock_shared() };
+            THROW_HR_IF(E_UNEXPECTED, !m_backgroundTaskArgs);
+            eventArgs = m_backgroundTaskArgs;
+        }
+        else // The process was launched via ShellExecute and we need to parse the uri (Only unpackaged)
+        {
+            for (auto const& pair : uri.QueryParsed())
             {
-                // Convert escaped components to its normal content
-                // from the conversion done in the LRP (see NotificationListener.cpp)
-                std::wstring payloadAsEscapedWstring{ pair.Value() };
-                std::wstring payloadAsWstring{ winrt::Windows::Foundation::Uri::UnescapeComponent(payloadAsEscapedWstring) };
-                return winrt::make<winrt::Microsoft::Windows::PushNotifications::implementation::PushNotificationReceivedEventArgs>(payloadAsWstring);
+                if (pair.Name() == L"payload")
+                {
+                    // Convert escaped components to its normal content
+                    // from the conversion done in the LRP (see NotificationListener.cpp)
+                    std::wstring payloadAsEscapedWstring{ pair.Value() };
+                    std::wstring payloadAsWstring{ winrt::Windows::Foundation::Uri::UnescapeComponent(payloadAsEscapedWstring) };
+                    eventArgs = winrt::make<winrt::Microsoft::Windows::PushNotifications::implementation::PushNotificationReceivedEventArgs>(payloadAsWstring);
+                }
             }
+
+            THROW_HR_IF_NULL_MSG(E_UNEXPECTED, eventArgs, "Could not serialize payload from command line Uri!");
         }
 
-        THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_TIMEOUT), !m_waitHandleForArgs.wait(c_receiveArgsTimeoutInMSec));
-        THROW_HR_IF(E_UNEXPECTED, !m_backgroundTaskArgs);
-        return m_backgroundTaskArgs;
+        return eventArgs;
     }
 
     winrt::IAsyncOperationWithProgress<winrt::Microsoft::Windows::PushNotifications::PushNotificationCreateChannelResult, winrt::Microsoft::Windows::PushNotifications::PushNotificationCreateChannelStatus> PushNotificationManager::CreateChannelAsync(const winrt::guid remoteId)
@@ -469,18 +489,15 @@ namespace winrt::Microsoft::Windows::PushNotifications::implementation
                     THROW_IF_FAILED(notificationPlatform->UnregisterFullTrustApplication(processName.c_str()));
                 }) };
 
-                // Registers a NoticicationListener and foreground delegate with the Long Running Process singleton
-                auto notificationsLongRunningPlatform{ PushNotificationHelpers::GetNotificationPlatform() };
-
                 // Register a sink with platform brokered through PushNotificationsLongRunningProcess
-                THROW_IF_FAILED(notificationsLongRunningPlatform->RegisterForegroundActivator(PushNotificationManager::Default().as<IWpnForegroundSink>().get(), processName.c_str()));
+                THROW_IF_FAILED(notificationPlatform->RegisterForegroundActivator(PushNotificationManager::Default().as<IWpnForegroundSink>().get(), processName.c_str()));
                 {
                     auto lock{ m_lock.lock_exclusive() };
                     m_singletonForegroundRegistration = true;
                 }
                 auto scopeExitToCleanForegroundSink{ wil::scope_exit([&]()
                 {
-                    THROW_IF_FAILED(notificationsLongRunningPlatform->UnregisterForegroundActivator(processName.c_str()));
+                    THROW_IF_FAILED(notificationPlatform->UnregisterForegroundActivator(processName.c_str()));
                     m_singletonForegroundRegistration = false;
                 }
                 ) };
@@ -491,7 +508,7 @@ namespace winrt::Microsoft::Windows::PushNotifications::implementation
                     registeredClsid = m_registeredClsid;
                 }
                 // registeredClsid is set to GUID_NULL for unpackaged applications
-                THROW_IF_FAILED(notificationsLongRunningPlatform->RegisterLongRunningActivatorWithClsid(processName.c_str(), registeredClsid));
+                THROW_IF_FAILED(notificationPlatform->RegisterLongRunningActivatorWithClsid(processName.c_str(), registeredClsid));
                 {
                     auto lock{ m_lock.lock_exclusive() };
                     m_singletonLongRunningSinkRegistration = true;
@@ -499,7 +516,7 @@ namespace winrt::Microsoft::Windows::PushNotifications::implementation
 
                 auto scopeExitToCleanLongRunningSink{ wil::scope_exit([&]()
                 {
-                    THROW_IF_FAILED(notificationsLongRunningPlatform->UnregisterLongRunningActivator(processName.c_str()));
+                    THROW_IF_FAILED(notificationPlatform->UnregisterLongRunningActivator(processName.c_str()));
                     m_singletonLongRunningSinkRegistration = false;
                 }
                 ) };

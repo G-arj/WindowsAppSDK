@@ -435,11 +435,6 @@ namespace Microsoft.Windows.PushNotifications
     [feature(Feature_PushNotifications)]
     runtimeclass PushNotificationCreateChannelResult
     {
-        PushNotificationCreateChannelResult(
-            PushNotificationChannel channel,
-            HRESULT extendedError,
-            PushNotificationChannelStatus status);
-
         // A PushNotificationChannel only exists Status when is CompletedSuccess.
         PushNotificationChannel Channel { get; };
 
@@ -453,6 +448,10 @@ namespace Microsoft.Windows.PushNotifications
     [feature(Feature_PushNotifications)]
     runtimeclass PushNotificationManager
     {
+        // Checks to see if the APIs are supported for the Desktop app
+        // Certain self-contained apps may not support Push Notification scenarios by design
+        static Boolean IsSupported();
+
         // Gets a Default instance of a PushNotificationManager
         static PushNotificationManager Default{ get; };
 
